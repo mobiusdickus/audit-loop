@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/parse.sh"
+source "$SCRIPT_DIR/lib/log.sh"
+
+# Defaults
+MAX_ROUNDS="${AUDIT_MAX_ROUNDS:-3}"
+BASE="${AUDIT_BASE:-main}"
+TIMEOUT="${AUDIT_TIMEOUT:-300}"
+AGENT="${AUDIT_AGENT:-mobius}"
+DRY_RUN=false
+
+# Parse args
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --max-rounds) MAX_ROUNDS="$2"; shift 2 ;;
+    --base) BASE="$2"; shift 2 ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    --agent) AGENT="$2"; shift 2 ;;
+    --log-dir) export AUDIT_LOG_DIR="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    -h|--help)
+      echo "Usage: audit-loop [OPTIONS]"
+      echo ""
+      echo "Options:"
+      echo "  --max-rounds N    Max review rounds (default: 3)"
+      echo "  --base BRANCH     Base branch to diff against (default: main)"
+      echo "  --timeout SECS    Timeout per agent invocation (default: 300)"
+      echo "  --agent NAME      Kiro agent for addressing (default: mobius)"
+      echo "  --log-dir PATH    Directory for review logs (default: .audit/reviews)"
+      echo "  --dry-run         Show what would be reviewed, don't run"
+      exit 0
+      ;;
+    *) log_error "Unknown option: $1"; exit 1 ;;
+  esac
+done
+
+# Preflight checks
+command -v claude >/dev/null 2>&1 || { log_error "claude CLI not found"; exit 1; }
+command -v kiro-cli >/dev/null 2>&1 || { log_error "kiro-cli not found"; exit 1; }
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { log_error "Not in a git repo"; exit 1; }
+
+BRANCH=$(git branch --show-current)
+DIFF_STATS=$(git diff "$BASE"..HEAD --stat 2>/dev/null | tail -1)
+
+# Capture combined diff (committed + unstaged)
+capture_diff() {
+  {
+    git diff "$BASE"..HEAD 2>/dev/null
+    git diff 2>/dev/null
+  } | cat
+}
+
+DIFF=$(capture_diff)
+
+if [ -z "$DIFF" ]; then
+  log_info "No changes to review (branch ${BRANCH} vs ${BASE})"
+  exit 0
+fi
+
+if [ "$DRY_RUN" = true ]; then
+  log_info "Dry run — would review:"
+  log_info "  Branch: $BRANCH"
+  log_info "  Base: $BASE"
+  log_info "  Stats: $DIFF_STATS"
+  log_info "  Max rounds: $MAX_ROUNDS"
+  exit 0
+fi
+
+# Build prompt from template, replacing {{VAR}} placeholders
+build_auditor_prompt() {
+  local diff="$1" prior_response="${2:-}"
+  local template
+  template=$(cat "$SCRIPT_DIR/prompts/auditor.md")
+
+  # Replace {{DIFF}}
+  local prompt="${template//\{\{DIFF\}\}/$diff}"
+
+  # Replace {{PRIOR_RESPONSE}}
+  if [ -n "$prior_response" ]; then
+    local context="## Prior Round Context
+
+The implementer addressed your previous findings. Here is their response:
+
+${prior_response}
+
+If they rejected a finding with valid reasoning, do not re-flag it.
+If their reasoning is wrong, escalate with stronger justification."
+    prompt="${prompt//\{\{PRIOR_RESPONSE\}\}/$context}"
+  else
+    prompt="${prompt//\{\{PRIOR_RESPONSE\}\}/}"
+  fi
+
+  echo "$prompt"
+}
+
+build_addresser_prompt() {
+  local findings="$1"
+  local template
+  template=$(cat "$SCRIPT_DIR/prompts/addresser.md")
+  echo "${template//\{\{FINDINGS\}\}/$findings}"
+}
+
+# Init log
+log_init "$BRANCH" "$BASE" "$MAX_ROUNDS"
+START_TIME=$(date +%s)
+
+PRIOR_RESPONSE=""
+ROUND=0
+VERDICT="UNKNOWN"
+
+while [ "$ROUND" -lt "$MAX_ROUNDS" ]; do
+  ROUND=$((ROUND + 1))
+  log_info "Round ${ROUND}/${MAX_ROUNDS} — sending diff to Claude..."
+
+  # Capture fresh diff each round
+  DIFF=$(capture_diff)
+
+  # Build and send auditor prompt
+  AUDITOR_PROMPT=$(build_auditor_prompt "$DIFF" "$PRIOR_RESPONSE")
+  AUDIT_OUTPUT=$(timeout "$TIMEOUT" claude -p "$AUDITOR_PROMPT" 2>/dev/null | strip_ansi) || {
+    log_error "Claude timed out or failed (round $ROUND)"
+    log_round_audit "$ROUND" "TIMEOUT" "Agent timed out after ${TIMEOUT}s"
+    VERDICT="TIMEOUT"
+    break
+  }
+
+  VERDICT=$(parse_verdict "$AUDIT_OUTPUT")
+  FINDINGS=$(parse_findings "$AUDIT_OUTPUT")
+
+  log_info "Claude verdict: $VERDICT"
+  log_round_audit "$ROUND" "$VERDICT" "$FINDINGS"
+
+  if [ "$VERDICT" = "APPROVED" ]; then
+    break
+  fi
+
+  if [ "$VERDICT" = "UNKNOWN" ]; then
+    log_error "Could not parse verdict from Claude's response"
+    break
+  fi
+
+  # Send findings to Kiro for resolution
+  log_info "Sending findings to Kiro for resolution..."
+
+  ADDRESSER_PROMPT=$(build_addresser_prompt "$FINDINGS")
+  KIRO_OUTPUT=$(timeout "$TIMEOUT" kiro-cli chat --no-interactive --agent "$AGENT" \
+    --trust-tools=read,write,grep,glob,code,shell "$ADDRESSER_PROMPT" 2>/dev/null | strip_ansi) || {
+    log_error "Kiro timed out or failed (round $ROUND)"
+    log_round_response "Agent timed out after ${TIMEOUT}s"
+    break
+  }
+
+  RESPONSE_TABLE=$(parse_response_table "$KIRO_OUTPUT")
+  PRIOR_RESPONSE="$RESPONSE_TABLE"
+
+  log_info "Kiro addressed findings"
+  log_round_response "$RESPONSE_TABLE"
+done
+
+# Finalize
+ELAPSED=$(( $(date +%s) - START_TIME ))
+DIFF_STATS=$(git diff "$BASE"..HEAD --stat 2>/dev/null | tail -1)
+log_finish "$ROUND" "$MAX_ROUNDS" "$VERDICT" "$ELAPSED" "$DIFF_STATS"
+
+log_info "Done. Log: $LOG_FILE"
+
+if [ "$VERDICT" = "APPROVED" ]; then
+  exit 0
+else
+  exit 1
+fi
