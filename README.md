@@ -5,8 +5,16 @@ Automated cross-agent code review. Claude audits your branch, Kiro addresses fin
 ## Install
 
 ```bash
-git clone <repo> ~/projects/personal/audit-loop
-ln -s ~/projects/personal/audit-loop/audit-loop ~/.local/bin/audit-loop
+go install github.com/mobiusdickus/audit-loop@latest
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/mobiusdickus/audit-loop.git
+cd audit-loop
+go build -o audit-loop .
+mv audit-loop ~/.local/bin/
 ```
 
 ## Requirements
