@@ -19,6 +19,7 @@ var prompts embed.FS
 var (
 	maxRounds = flag.Int("max-rounds", 3, "Max review rounds")
 	base      = flag.String("base", "main", "Base branch to diff against")
+	model     = flag.String("model", "claude-sonnet-4-6", "Claude model for auditing")
 	timeout   = flag.Duration("timeout", 5*time.Minute, "Timeout per agent invocation")
 	agent     = flag.String("agent", "mobius", "Kiro agent for addressing findings")
 	logDir    = flag.String("log-dir", ".audit/reviews", "Directory for review logs")
@@ -29,12 +30,14 @@ func main() {
 	flag.Parse()
 	loadEnvDefaults()
 
+	paths := flag.Args() // positional args are path filters
+
 	if err := preflight(); err != nil {
 		fatal(err.Error())
 	}
 
 	branch := gitBranch()
-	diff := captureDiff(*base)
+	diff := captureDiff(*base, paths)
 
 	if diff == "" {
 		info("No changes to review (branch %s vs %s)", branch, *base)
@@ -45,7 +48,7 @@ func main() {
 		info("Dry run — would review:")
 		info("  Branch: %s", branch)
 		info("  Base: %s", *base)
-		info("  Stats: %s", diffStats(*base))
+		info("  Stats: %s", diffStats(*base, paths))
 		info("  Max rounds: %d", *maxRounds)
 		os.Exit(0)
 	}
@@ -61,13 +64,17 @@ func main() {
 		round++
 		info("Round %d/%d — sending diff to Claude...", round, *maxRounds)
 
-		diff = captureDiff(*base)
+		diff = captureDiff(*base, paths)
 		auditPrompt := buildAuditorPrompt(diff, priorResponse)
 
-		auditOutput, err := runAgent("claude", []string{"-p", auditPrompt}, *timeout)
+		auditOutput, err := runAgent("claude", []string{"-p", auditPrompt, "--model", *model}, *timeout)
 		if err != nil {
 			errorf("Claude failed (round %d): %v", round, err)
-			log.writeRoundAudit(round, "ERROR", err.Error())
+			detail := err.Error()
+			if auditOutput != "" {
+				detail = auditOutput + "\n\n" + detail
+			}
+			log.writeRoundAudit(round, "ERROR", detail)
 			verdict = "ERROR"
 			break
 		}
@@ -92,13 +99,17 @@ func main() {
 		kiroArgs := []string{
 			"chat", "--no-interactive",
 			"--agent", *agent,
-			"--trust-tools=read,write,grep,glob,code,shell",
+			"--trust-tools=read,write,grep,glob,code",
 			addresserPrompt,
 		}
 		kiroOutput, err := runAgent("kiro-cli", kiroArgs, *timeout)
 		if err != nil {
-			errorf("Kiro failed (round %d): %v", round, err)
-			log.writeRoundResponse("Agent failed: " + err.Error())
+			detail := err.Error()
+			if kiroOutput != "" {
+				detail = kiroOutput + "\n\n" + detail
+			}
+			errorf("Kiro failed (round %d): %v", round, detail)
+			log.writeRoundResponse("Agent failed: " + detail)
 			break
 		}
 
@@ -110,7 +121,7 @@ func main() {
 	}
 
 	elapsed := time.Since(start)
-	log.finish(round, verdict, elapsed, diffStats(*base))
+	log.finish(round, verdict, elapsed, diffStats(*base, paths))
 
 	info("Done in %s. Log: %s", elapsed.Round(time.Second), log.path)
 
@@ -127,14 +138,16 @@ func runAgent(name string, args []string, t time.Duration) (string, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, name, args...)
-	out, err := cmd.CombinedOutput()
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	output := stripANSI(string(out))
 
 	if ctx.Err() == context.DeadlineExceeded {
 		return output, fmt.Errorf("timed out after %s", t)
 	}
 	if err != nil {
-		return output, fmt.Errorf("%w: %s", err, output)
+		return output, fmt.Errorf("%w: %s", err, stderr.String())
 	}
 	return output, nil
 }
@@ -208,14 +221,15 @@ If they rejected a finding with valid reasoning, do not re-flag it.
 If their reasoning is wrong, escalate with stronger justification.`, priorResponse)
 	}
 
-	prompt := strings.ReplaceAll(tmpl, "{{DIFF}}", diff)
-	prompt = strings.ReplaceAll(prompt, "{{PRIOR_RESPONSE}}", priorCtx)
-	return prompt
+	// Single-pass replacement against original template to prevent
+	// diff content containing placeholders from being substituted.
+	r := strings.NewReplacer("{{DIFF}}", diff, "{{PRIOR_RESPONSE}}", priorCtx)
+	return r.Replace(tmpl)
 }
 
 func buildAddresserPrompt(findings string) string {
 	tmpl := mustReadPrompt("prompts/addresser.md")
-	return strings.ReplaceAll(tmpl, "{{FINDINGS}}", findings)
+	return strings.NewReplacer("{{FINDINGS}}", findings).Replace(tmpl)
 }
 
 func mustReadPrompt(name string) string {
@@ -234,7 +248,9 @@ type reviewLog struct {
 }
 
 func newReviewLog(dir, branch, base string, maxRounds int) *reviewLog {
-	os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fatal("cannot create log dir: %v", err)
+	}
 	ts := time.Now().Format("20060102-150405")
 	path := filepath.Join(dir, ts+".md")
 
@@ -274,24 +290,33 @@ func (l *reviewLog) finish(rounds int, verdict string, elapsed time.Duration, st
 	} else {
 		fmt.Fprintf(l.f, "⚠️ Max rounds exhausted. Unresolved findings remain.\n")
 	}
-	l.f.Close()
+	if err := l.f.Close(); err != nil {
+		errorf("log close failed: %v", err)
+	}
 }
 
 // --- Git helpers ---
 
-func captureDiff(base string) string {
-	committed := gitCmd("diff", base+"..HEAD")
-	unstaged := gitCmd("diff")
-	return committed + unstaged
+func captureDiff(base string, paths []string) string {
+	committed := gitCmd(append([]string{"diff", base + "..HEAD", "--"}, paths...)...)
+	working := gitCmd(append([]string{"diff", "HEAD", "--"}, paths...)...)
+	return committed + working
 }
 
-func diffStats(base string) string {
-	out := gitCmd("diff", "--stat", base+"..HEAD")
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) == 0 {
-		return ""
+func diffStats(base string, paths []string) string {
+	var parts []string
+	for _, baseArgs := range [][]string{
+		{"diff", "--stat", base + "..HEAD", "--"},
+		{"diff", "--stat", "HEAD", "--"},
+	} {
+		args := append(baseArgs, paths...)
+		out := strings.TrimSpace(gitCmd(args...))
+		if out != "" {
+			lines := strings.Split(out, "\n")
+			parts = append(parts, lines[len(lines)-1])
+		}
 	}
-	return lines[len(lines)-1]
+	return strings.Join(parts, " | ")
 }
 
 func gitBranch() string {
@@ -311,6 +336,9 @@ func loadEnvDefaults() {
 	}
 	if v := os.Getenv("AUDIT_BASE"); v != "" {
 		*base = v
+	}
+	if v := os.Getenv("AUDIT_MODEL"); v != "" {
+		*model = v
 	}
 	if v := os.Getenv("AUDIT_TIMEOUT"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
@@ -334,6 +362,9 @@ func preflight() error {
 	out, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Output()
 	if err != nil || strings.TrimSpace(string(out)) != "true" {
 		return fmt.Errorf("not inside a git repository")
+	}
+	if _, err := exec.Command("git", "rev-parse", "--verify", *base).Output(); err != nil {
+		return fmt.Errorf("base ref %q not found", *base)
 	}
 	return nil
 }
