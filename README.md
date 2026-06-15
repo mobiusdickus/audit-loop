@@ -1,6 +1,8 @@
 # audit-loop
 
-Automated cross-agent review loop. Claude critiques, Kiro addresses. Loops until approved.
+Automated review loop built around [Kiro](https://kiro.dev). An external auditor critiques, Kiro addresses findings by editing code directly. Loops until approved.
+
+Kiro is the agent that does the real work — reading files, making changes, and deciding what to fix or reject. The auditor (Claude or Codex) just reviews and provides feedback.
 
 Works on code diffs (default) or any file content — design docs, specs, proposals, whatever you point it at.
 
@@ -21,8 +23,8 @@ mv audit-loop ~/.local/bin/
 
 ## Requirements
 
-- `claude` CLI (Claude Code)
-- `kiro-cli` (with agents configured)
+- `kiro-cli` (the agent that addresses findings — with agents configured)
+- `claude` CLI or `codex` CLI (the auditor — reviews and critiques)
 - `git` (only in diff mode)
 
 ## Usage
@@ -51,10 +53,10 @@ audit-loop --dry-run
 ## How it works
 
 1. Captures content (git diff by default, or `--input` file)
-2. Sends content to Claude with auditor prompt
-3. If Claude says NEEDS_CHANGES → sends findings to Kiro
+2. Sends content to auditor (Claude/Codex) for critique
+3. If auditor says NEEDS_CHANGES → sends findings to Kiro
 4. Kiro fixes what it agrees with, rejects what it doesn't (with reasoning)
-5. Content re-captured and sent back to Claude (with Kiro's prior response)
+5. Content re-captured and sent back to auditor (with Kiro's prior response)
 6. Repeats until APPROVED or max rounds exhausted
 
 No commits are made during the loop. Changes stay unstaged. You decide what to keep.
