@@ -208,6 +208,7 @@ The auditor prompt **must** produce output where the first matching line is eith
 | `--base BRANCH` | main | Base branch to diff against |
 | `--input PATH` | — | File to review (uses file mode instead of diff mode) |
 | `--theme NAME` | — | Theme name or path (dir with auditor.md + addresser.md) |
+| `--auditor NAME` | claude | Auditor CLI: `claude` or `codex` |
 | `--model MODEL` | claude-sonnet-4-6 | Claude model for auditing |
 | `--timeout SECS` | 300 | Timeout per agent call |
 | `--agent NAME` | mobius | Kiro agent for addressing |
@@ -216,4 +217,4 @@ The auditor prompt **must** produce output where the first matching line is eith
 
 ## Environment variables
 
-All flags have env var equivalents: `AUDIT_MAX_ROUNDS`, `AUDIT_BASE`, `AUDIT_INPUT`, `AUDIT_TIMEOUT`, `AUDIT_AGENT`, `AUDIT_THEME`, `AUDIT_MODEL`, `AUDIT_LOG_DIR`.
+All flags have env var equivalents: `AUDIT_MAX_ROUNDS`, `AUDIT_BASE`, `AUDIT_INPUT`, `AUDIT_TIMEOUT`, `AUDIT_AGENT`, `AUDIT_THEME`, `AUDIT_AUDITOR`, `AUDIT_MODEL`, `AUDIT_LOG_DIR`.
