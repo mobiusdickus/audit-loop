@@ -107,6 +107,7 @@ Defaults (overridable via flags or env vars):
 |---------|---------|------|-----|
 | Max rounds | 3 | `--max-rounds` | `AUDIT_MAX_ROUNDS` |
 | Base branch | main | `--base` | `AUDIT_BASE` |
+| Theme | (embedded) | `--theme` | `AUDIT_THEME` |
 | Log dir | .audit/reviews | `--log-dir` | `AUDIT_LOG_DIR` |
 | Timeout (per agent) | 300s | `--timeout` | `AUDIT_TIMEOUT` |
 | Kiro agent | mobius | `--agent` | `AUDIT_AGENT` |

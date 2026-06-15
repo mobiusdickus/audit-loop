@@ -23,6 +23,7 @@ var (
 	timeout   = flag.Duration("timeout", 5*time.Minute, "Timeout per agent invocation")
 	agent     = flag.String("agent", "mobius", "Kiro agent for addressing findings")
 	logDir    = flag.String("log-dir", ".audit/reviews", "Directory for review logs")
+	theme     = flag.String("theme", "", "Theme name or path (directory with auditor.md + addresser.md)")
 	dryRun    = flag.Bool("dry-run", false, "Show what would be reviewed, don't run")
 )
 
@@ -50,7 +51,19 @@ func main() {
 		info("  Base: %s", *base)
 		info("  Stats: %s", diffStats(*base, paths))
 		info("  Max rounds: %d", *maxRounds)
+		if *theme != "" {
+			info("  Theme: %s", *theme)
+		}
 		os.Exit(0)
+	}
+
+	themeDir := resolveThemeDir()
+	if themeDir != "" {
+		for _, f := range []string{"auditor.md", "addresser.md"} {
+			if _, err := os.Stat(filepath.Join(themeDir, f)); err != nil {
+				fatal("theme missing required file %s: %v", f, err)
+			}
+		}
 	}
 
 	log := newReviewLog(*logDir, branch, *base, *maxRounds)
@@ -65,7 +78,7 @@ func main() {
 		info("Round %d/%d — sending diff to Claude...", round, *maxRounds)
 
 		diff = captureDiff(*base, paths)
-		auditPrompt := buildAuditorPrompt(diff, priorResponse)
+		auditPrompt := buildAuditorPrompt(themeDir, diff, priorResponse, branch, round)
 
 		auditOutput, err := runAgent("claude", []string{"-p", auditPrompt, "--model", *model}, *timeout)
 		if err != nil {
@@ -94,7 +107,7 @@ func main() {
 		}
 
 		info("Sending findings to Kiro for resolution...")
-		addresserPrompt := buildAddresserPrompt(findings)
+		addresserPrompt := buildAddresserPrompt(themeDir, findings, branch, round)
 
 		kiroArgs := []string{
 			"chat", "--no-interactive",
@@ -204,10 +217,50 @@ func stripANSI(s string) string {
 	return ansiRe.ReplaceAllString(s, "")
 }
 
-// --- Prompt builder ---
+// --- Theme / Prompt builder ---
 
-func buildAuditorPrompt(diff, priorResponse string) string {
-	tmpl := mustReadPrompt("prompts/auditor.md")
+func resolveThemeDir() string {
+	if *theme == "" {
+		return "" // use embedded defaults
+	}
+	// If path exists as-is, use it
+	if info, err := os.Stat(*theme); err == nil && info.IsDir() {
+		return *theme
+	}
+	// Check ~/.config/audit-loop/themes/<name>/
+	home, err := os.UserHomeDir()
+	if err == nil {
+		themesRoot := filepath.Join(home, ".config", "audit-loop", "themes")
+		dir, _ := filepath.Abs(filepath.Join(themesRoot, *theme))
+		if !strings.HasPrefix(dir+string(os.PathSeparator), themesRoot+string(os.PathSeparator)) {
+			fatal("theme path %q escapes themes directory", *theme)
+		}
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+	fatal("theme %q not found (checked path and ~/.config/audit-loop/themes/)", *theme)
+	return ""
+}
+
+func loadPrompt(themeDir, name string) string {
+	if themeDir != "" {
+		path := filepath.Join(themeDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			fatal("theme missing %s: %v", path, err)
+		}
+		return string(data)
+	}
+	data, err := prompts.ReadFile("prompts/" + name)
+	if err != nil {
+		fatal("missing embedded prompt: %s", name)
+	}
+	return string(data)
+}
+
+func buildAuditorPrompt(themeDir, diff, priorResponse string, branch string, round int) string {
+	tmpl := loadPrompt(themeDir, "auditor.md")
 
 	var priorCtx string
 	if priorResponse != "" {
@@ -221,23 +274,25 @@ If they rejected a finding with valid reasoning, do not re-flag it.
 If their reasoning is wrong, escalate with stronger justification.`, priorResponse)
 	}
 
-	// Single-pass replacement against original template to prevent
-	// diff content containing placeholders from being substituted.
-	r := strings.NewReplacer("{{DIFF}}", diff, "{{PRIOR_RESPONSE}}", priorCtx)
+	r := strings.NewReplacer(
+		"{{DIFF}}", diff,
+		"{{PRIOR_RESPONSE}}", priorCtx,
+		"{{BRANCH}}", branch,
+		"{{BASE}}", *base,
+		"{{ROUND}}", fmt.Sprintf("%d", round),
+	)
 	return r.Replace(tmpl)
 }
 
-func buildAddresserPrompt(findings string) string {
-	tmpl := mustReadPrompt("prompts/addresser.md")
-	return strings.NewReplacer("{{FINDINGS}}", findings).Replace(tmpl)
-}
-
-func mustReadPrompt(name string) string {
-	data, err := prompts.ReadFile(name)
-	if err != nil {
-		fatal("missing embedded prompt: %s", name)
-	}
-	return string(data)
+func buildAddresserPrompt(themeDir, findings string, branch string, round int) string {
+	tmpl := loadPrompt(themeDir, "addresser.md")
+	r := strings.NewReplacer(
+		"{{FINDINGS}}", findings,
+		"{{BRANCH}}", branch,
+		"{{BASE}}", *base,
+		"{{ROUND}}", fmt.Sprintf("%d", round),
+	)
+	return r.Replace(tmpl)
 }
 
 // --- Log writer ---
@@ -347,6 +402,9 @@ func loadEnvDefaults() {
 	}
 	if v := os.Getenv("AUDIT_AGENT"); v != "" {
 		*agent = v
+	}
+	if v := os.Getenv("AUDIT_THEME"); v != "" {
+		*theme = v
 	}
 	if v := os.Getenv("AUDIT_LOG_DIR"); v != "" {
 		*logDir = v
