@@ -700,10 +700,13 @@ If they rejected a finding with valid reasoning, do not re-flag it.
 If their reasoning is wrong, escalate with stronger justification.`, priorResponse)
 	}
 
+	grounding := extractEnvironmentFacts()
+
 	r := strings.NewReplacer(
 		"{{CONTENT}}", diff,
 		"{{DIFF}}", diff,
 		"{{PRIOR_RESPONSE}}", priorCtx,
+		"{{GROUNDING}}", grounding,
 		"{{BRANCH}}", branch,
 		"{{BASE}}", *base,
 		"{{ROUND}}", fmt.Sprintf("%d", round),
@@ -854,6 +857,45 @@ func gitCmd(args ...string) (string, error) {
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return string(out), nil
+}
+
+// --- Environment grounding ---
+
+// manifestFiles are project manifests that declare language/dependency versions.
+var manifestFiles = []string{
+	"go.mod",
+	"go.sum",
+	"package.json",
+	"Cargo.toml",
+	"pyproject.toml",
+	"requirements.txt",
+	"pom.xml",
+	"build.gradle",
+	"Gemfile",
+}
+
+// extractEnvironmentFacts reads manifest files from the project root and returns
+// an authoritative context block for the auditor. This prevents false positives
+// caused by stale training data (e.g., flagging a valid Go version as non-existent).
+func extractEnvironmentFacts() string {
+	var sections []string
+	for _, name := range manifestFiles {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		// For large files (go.sum, lock files), truncate to keep prompt reasonable
+		if len(content) > 4096 {
+			content = content[:4096] + "\n... (truncated)\n"
+		}
+		sections = append(sections, fmt.Sprintf("// %s\n%s", name, content))
+	}
+	if len(sections) == 0 {
+		return ""
+	}
+	return "## Environment (authoritative — do not contradict)\nThese are runtime-extracted project facts. If your training data conflicts with them, your training data is wrong.\n\n" +
+		strings.Join(sections, "\n\n")
 }
 
 // --- Env/config helpers ---
