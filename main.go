@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"flag"
@@ -23,13 +24,24 @@ var (
 	model     = flag.String("model", "claude-sonnet-4-6", "Claude model for auditing")
 	auditor   = flag.String("auditor", "claude", "Auditor CLI: claude or codex")
 	timeout   = flag.Duration("timeout", 5*time.Minute, "Timeout per agent invocation")
-	agent     = flag.String("agent", "mobius", "Kiro agent for addressing findings")
+	agent     = flag.String("agent", "", "Kiro agent for addressing findings")
 	logDir    = flag.String("log-dir", ".audit/reviews", "Directory for review logs")
 	theme     = flag.String("theme", "", "Theme name or path (directory with auditor.md + addresser.md)")
 	dryRun    = flag.Bool("dry-run", false, "Show what would be reviewed, don't run")
+	full      = flag.Bool("full", false, "Review entire repo, not just branch diff")
+	ctxPaths  = flag.String("context", "", "Comma-separated file/dir paths for discuss context")
 )
 
 func main() {
+	// Subcommand dispatch before flag.Parse()
+	if len(os.Args) > 1 && os.Args[1] == "discuss" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+		flag.Parse()
+		loadEnvDefaults()
+		runDiscuss()
+		return
+	}
+
 	flag.Parse()
 	loadEnvDefaults()
 
@@ -164,8 +176,12 @@ func main() {
 
 		kiroArgs := []string{
 			"chat", "--no-interactive",
-			"--agent", *agent,
 			"--trust-tools=read,write,grep,glob,code",
+		}
+		if *agent != "" {
+			kiroArgs = append(kiroArgs, "--agent", *agent)
+		} else {
+			info("No --agent specified; using kiro-cli default agent")
 		}
 		kiroOutput, err := runAgent("kiro-cli", kiroArgs, addresserPrompt, *timeout)
 		if err != nil {
@@ -202,7 +218,331 @@ func main() {
 	os.Exit(1)
 }
 
-// --- Agent runner ---
+// --- Discuss mode ---
+
+var discussVerdictRe = regexp.MustCompile(`(?m)^(CONSENSUS|DISAGREE)`)
+
+func runDiscuss() {
+	question := strings.Join(flag.Args(), " ")
+	if question == "" {
+		fatal("usage: audit-loop discuss [--context files] \"question\"")
+	}
+
+	if *maxRounds < 1 {
+		fatal("--max-rounds must be at least 1")
+	}
+
+	if err := preflightTools(); err != nil {
+		fatal(err.Error())
+	}
+
+	fileContext := loadContext(*ctxPaths)
+
+	if *dryRun {
+		info("Dry run — would discuss:")
+		info("  Question: %s", question)
+		info("  Context: %s", *ctxPaths)
+		info("  Max rounds: %d", *maxRounds)
+		os.Exit(0)
+	}
+
+	dlog := newDiscussLog(*logDir, question, *ctxPaths, *maxRounds)
+	start := time.Now()
+
+	var claudePosition, kiroPosition string
+	var verdict string
+
+	for round := 1; round <= *maxRounds; round++ {
+		if round == 1 {
+			// Blind first round — both agents respond independently
+			info("Round 1/%d — blind positions...", *maxRounds)
+
+			claudePrompt := buildDiscussPrompt("discuss-claude.md", question, fileContext, "", true)
+			kiroPrompt := buildDiscussPrompt("discuss-kiro.md", question, fileContext, "", true)
+
+			var claudeErr, kiroErr error
+			claudePosition, claudeErr = runAgent("claude", []string{"-p", "--model", *model}, claudePrompt, *timeout)
+			if claudeErr != nil {
+				errorf("Claude failed: %v", claudeErr)
+				verdict = "ERROR"
+				break
+			}
+
+			kiroArgs := []string{"chat", "--no-interactive", "--trust-tools=read,grep,glob,code"}
+			if *agent != "" {
+				kiroArgs = append(kiroArgs, "--agent", *agent)
+			}
+			kiroPosition, kiroErr = runAgent("kiro-cli", kiroArgs, kiroPrompt, *timeout)
+			if kiroErr != nil {
+				errorf("Kiro failed: %v", kiroErr)
+				verdict = "ERROR"
+				break
+			}
+
+			dlog.writeRound(round, claudePosition, kiroPosition)
+			info("  Claude: %s", parseDiscussVerdict(claudePosition))
+			info("  Kiro: %s", parseDiscussVerdict(kiroPosition))
+		} else {
+			// Debate rounds — each sees the other's prior position
+			info("Round %d/%d — debate...", round, *maxRounds)
+
+			claudePrompt := buildDiscussPrompt("discuss-claude.md", question, fileContext, kiroPosition, false)
+			prevClaudePosition := claudePosition
+			var claudeErr error
+			claudePosition, claudeErr = runAgent("claude", []string{"-p", "--model", *model}, claudePrompt, *timeout)
+			if claudeErr != nil {
+				errorf("Claude failed (round %d): %v", round, claudeErr)
+				verdict = "ERROR"
+				break
+			}
+
+			kiroPrompt := buildDiscussPrompt("discuss-kiro.md", question, fileContext, prevClaudePosition, false)
+			kiroArgs := []string{"chat", "--no-interactive", "--trust-tools=read,grep,glob,code"}
+			if *agent != "" {
+				kiroArgs = append(kiroArgs, "--agent", *agent)
+			}
+			var kiroErr error
+			kiroPosition, kiroErr = runAgent("kiro-cli", kiroArgs, kiroPrompt, *timeout)
+			if kiroErr != nil {
+				errorf("Kiro failed (round %d): %v", round, kiroErr)
+				verdict = "ERROR"
+				break
+			}
+
+			dlog.writeRound(round, claudePosition, kiroPosition)
+			info("  Claude: %s", parseDiscussVerdict(claudePosition))
+			info("  Kiro: %s", parseDiscussVerdict(kiroPosition))
+		}
+
+		// Check if both reached consensus
+		cv := parseDiscussVerdict(claudePosition)
+		kv := parseDiscussVerdict(kiroPosition)
+		if cv == "CONSENSUS" && kv == "CONSENSUS" {
+			verdict = "CONSENSUS"
+			break
+		}
+		// If either says CONSENSUS in a later round, keep going to confirm the other agrees
+		if round == *maxRounds {
+			verdict = "SPLIT"
+		}
+	}
+
+	elapsed := time.Since(start)
+	dlog.finish(verdict, elapsed)
+	info("Done in %s. Outcome: %s. Log: %s", elapsed.Round(time.Second), verdict, dlog.path)
+
+	if verdict == "CONSENSUS" {
+		os.Exit(0)
+	}
+	os.Exit(1)
+}
+
+func buildDiscussPrompt(tmplName, question, fileContext, priorPosition string, blind bool) string {
+	tmpl := loadPrompt("", tmplName)
+
+	var ctxBlock string
+	if fileContext != "" {
+		var indented strings.Builder
+		indented.WriteString("## Code Context\n")
+		for _, line := range strings.Split(fileContext, "\n") {
+			indented.WriteString("    " + line + "\n")
+		}
+		ctxBlock = indented.String()
+	}
+
+	var priorBlock, format string
+	if blind {
+		format = "## Position\n<your reasoning and conclusion>"
+	} else {
+		priorBlock = fmt.Sprintf("## Other Agent's Position\n%s\n", priorPosition)
+		format = "## Steelman (opposing view)\n<strongest case for their position>\n\n## Position\n<your reasoning and conclusion>"
+	}
+
+	return strings.NewReplacer(
+		"{{QUESTION}}", question,
+		"{{CONTEXT}}", ctxBlock,
+		"{{PRIOR_ROUND}}", priorBlock,
+		"{{FORMAT}}", format,
+	).Replace(tmpl)
+}
+
+const (
+	maxFileSize    = 100 << 10 // 100 KB per file
+	maxContextSize = 512 << 10 // 512 KB total
+)
+
+func loadContext(paths string) string {
+	if paths == "" {
+		return ""
+	}
+	var parts []string
+	var total int
+
+	addFile := func(path string) error {
+		real, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			errorf("cannot resolve %q: %v", path, err)
+			return nil
+		}
+		if isSensitivePath(real) {
+			info("skipping sensitive file: %s", path)
+			return nil
+		}
+		fi, err := os.Stat(real)
+		if err != nil {
+			errorf("cannot read context %q: %v", path, err)
+			return nil
+		}
+		if fi.Size() > maxFileSize {
+			errorf("skipping %q: exceeds %d KB limit", path, maxFileSize>>10)
+			return nil
+		}
+		data, err := os.ReadFile(real)
+		if err != nil {
+			errorf("cannot read context %q: %v", path, err)
+			return nil
+		}
+		if bytes.ContainsRune(data, 0) {
+			errorf("skipping %q: binary file", path)
+			return nil
+		}
+		if total+len(data) > maxContextSize {
+			return fmt.Errorf("total context exceeds %d KB limit", maxContextSize>>10)
+		}
+		total += len(data)
+		parts = append(parts, fmt.Sprintf("// %s\n%s", path, string(data)))
+		return nil
+	}
+
+	for _, p := range strings.Split(paths, ",") {
+		p = strings.TrimSpace(p)
+		fi, err := os.Stat(p)
+		if err != nil {
+			errorf("cannot read context %q: %v", p, err)
+			continue
+		}
+		if fi.IsDir() {
+			werr := filepath.WalkDir(p, func(path string, d os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if d.IsDir() {
+					if d.Name() == ".git" || d.Name() == "node_modules" {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if isSensitivePath(path) {
+					info("skipping sensitive file: %s", path)
+					return nil
+				}
+				if e := addFile(path); e != nil {
+					return e
+				}
+				return nil
+			})
+			if werr != nil {
+				errorf("walk %q: %v", p, werr)
+				break
+			}
+			continue
+		}
+		if e := addFile(p); e != nil {
+			errorf("%v", e)
+			break
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func isSensitivePath(path string) bool {
+	name := filepath.Base(path)
+	lower := strings.ToLower(name)
+	switch lower {
+	case ".env", ".env.local", ".env.production", ".env.development",
+		"id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+		"credentials.json", ".npmrc", ".pypirc",
+		"credentials", "kubeconfig", "config.json":
+		return true
+	}
+	for _, ext := range []string{".pem", ".key", ".p12", ".pfx", ".jks", ".tfvars", ".token"} {
+		if strings.HasSuffix(lower, ext) {
+			return true
+		}
+	}
+	if strings.HasPrefix(lower, ".env.") {
+		return true
+	}
+	// Catch files inside .ssh/ directories
+	if strings.Contains(filepath.ToSlash(path), ".ssh/") {
+		return true
+	}
+	return false
+}
+
+func parseDiscussVerdict(output string) string {
+	m := discussVerdictRe.FindStringSubmatch(output)
+	if m == nil {
+		return "DISAGREE"
+	}
+	return m[1]
+}
+
+// --- Discuss log writer ---
+
+type discussLog struct {
+	path string
+	f    *os.File
+}
+
+func newDiscussLog(dir, question, ctxPaths string, maxRounds int) *discussLog {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fatal("cannot create log dir: %v", err)
+	}
+	ts := time.Now().Format("20060102-150405")
+	path := filepath.Join(dir, "discuss-"+ts+".md")
+
+	f, err := os.Create(path)
+	if err != nil {
+		fatal("cannot create log: %v", err)
+	}
+
+	fmt.Fprintf(f, "# Discussion — %s\n\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(f, "## Question\n%s\n\n", question)
+	if ctxPaths != "" {
+		fmt.Fprintf(f, "## Context\n%s\n\n", ctxPaths)
+	}
+	fmt.Fprintf(f, "## Meta\n- **Max rounds**: %d\n", maxRounds)
+
+	return &discussLog{path: path, f: f}
+}
+
+func (l *discussLog) writeRound(round int, claudeOutput, kiroOutput string) {
+	label := fmt.Sprintf("Round %d", round)
+	if round == 1 {
+		label = "Round 1 (blind)"
+	}
+	fmt.Fprintf(l.f, "\n---\n\n## %s\n\n", label)
+	fmt.Fprintf(l.f, "### Claude\n%s\n\n", strings.TrimSpace(claudeOutput))
+	fmt.Fprintf(l.f, "### Kiro\n%s\n", strings.TrimSpace(kiroOutput))
+}
+
+func (l *discussLog) finish(verdict string, elapsed time.Duration) {
+	fmt.Fprintf(l.f, "\n---\n\n## Conclusion\n")
+	fmt.Fprintf(l.f, "- **Outcome**: %s\n", verdict)
+	fmt.Fprintf(l.f, "- **Duration**: %s\n", elapsed.Round(time.Second))
+	switch verdict {
+	case "CONSENSUS":
+		fmt.Fprintf(l.f, "\n✅ Consensus reached.\n")
+	case "ERROR":
+		fmt.Fprintf(l.f, "\n⚠️ Agent error — review halted early.\n")
+	default:
+		fmt.Fprintf(l.f, "\n⚠️ No consensus. See final positions above.\n")
+	}
+	if err := l.f.Close(); err != nil {
+		errorf("log close failed: %v", err)
+	}
+}
 
 func auditorArgs(prompt string) (string, []string, string) {
 	switch *auditor {
@@ -279,6 +619,10 @@ func parseResponseTable(output string) string {
 				break
 			}
 		}
+	}
+	if len(table) == 0 {
+		errorf("could not extract response table; passing full Kiro output as prior context")
+		return output
 	}
 	return strings.Join(table, "\n")
 }
@@ -449,6 +793,18 @@ func captureContent(fileMode bool, paths []string) (string, error) {
 // --- Git helpers ---
 
 func captureDiff(base string, paths []string) (string, error) {
+	if *full {
+		const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+		committed, err := gitCmd(append([]string{"diff", emptyTree, "HEAD", "--"}, paths...)...)
+		if err != nil {
+			return "", fmt.Errorf("failed to capture committed diff: %v", err)
+		}
+		working, err := gitCmd(append([]string{"diff", "HEAD", "--"}, paths...)...)
+		if err != nil {
+			return "", fmt.Errorf("failed to capture working diff: %v", err)
+		}
+		return committed + working, nil
+	}
 	committed, err := gitCmd(append([]string{"diff", base + "..HEAD", "--"}, paths...)...)
 	if err != nil {
 		return "", fmt.Errorf("failed to capture committed diff: %v", err)
@@ -461,9 +817,13 @@ func captureDiff(base string, paths []string) (string, error) {
 }
 
 func diffStats(base string, paths []string) string {
+	baseRef := base + "..HEAD"
+	if *full {
+		baseRef = "4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD"
+	}
 	var parts []string
 	for _, baseArgs := range [][]string{
-		{"diff", "--stat", base + "..HEAD", "--"},
+		{"diff", "--stat", baseRef, "--"},
 		{"diff", "--stat", "HEAD", "--"},
 	} {
 		args := append(baseArgs, paths...)
@@ -530,18 +890,30 @@ func loadEnvDefaults() {
 	}
 }
 
-func preflight() error {
-	for _, cmd := range []string{*auditor, "kiro-cli", "git"} {
+func preflightTools() error {
+	for _, cmd := range []string{*auditor, "kiro-cli"} {
 		if _, err := exec.LookPath(cmd); err != nil {
 			return fmt.Errorf("%s not found in PATH", cmd)
 		}
+	}
+	return nil
+}
+
+func preflight() error {
+	if err := preflightTools(); err != nil {
+		return err
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		return fmt.Errorf("git not found in PATH")
 	}
 	out, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Output()
 	if err != nil || strings.TrimSpace(string(out)) != "true" {
 		return fmt.Errorf("not inside a git repository")
 	}
-	if _, err := exec.Command("git", "rev-parse", "--verify", *base).Output(); err != nil {
-		return fmt.Errorf("base ref %q not found", *base)
+	if !*full {
+		if _, err := exec.Command("git", "rev-parse", "--verify", *base).Output(); err != nil {
+			return fmt.Errorf("base ref %q not found", *base)
+		}
 	}
 	return nil
 }

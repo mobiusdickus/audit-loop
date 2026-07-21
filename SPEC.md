@@ -55,8 +55,8 @@ If they disagree for the remaining rounds, the loop exits at max rounds and the 
 - Timeout: 5 min
 
 ### Addresser (Kiro)
-- Invoked via: `kiro-cli chat --no-interactive --agent mobius --trust-tools=read,write,grep,glob,code,shell "<prompt>"`
-- Persona: Mobius (full power — needs shell, write, etc. to fix code)
+- Invoked via: `kiro-cli chat --no-interactive --trust-tools=read,write,grep,glob,code "<prompt>"`
+- Persona: Mobius (needs write, code, etc. to fix code)
 - Output: What it fixed, what it rejected, reasoning for each
 - Timeout: 5 min
 
@@ -110,7 +110,7 @@ Defaults (overridable via flags or env vars):
 | Theme | (embedded) | `--theme` | `AUDIT_THEME` |
 | Log dir | .audit/reviews | `--log-dir` | `AUDIT_LOG_DIR` |
 | Timeout (per agent) | 300s | `--timeout` | `AUDIT_TIMEOUT` |
-| Kiro agent | mobius | `--agent` | `AUDIT_AGENT` |
+| Kiro agent | — | `--agent` | `AUDIT_AGENT` |
 
 ## File Structure
 
@@ -172,9 +172,128 @@ Findings to address:
 {{findings}}
 ```
 
+## Discuss Mode
+
+A deliberation mode where both agents independently reason about a question, then debate to converge or surface genuine disagreement.
+
+### Usage
+
+```bash
+audit-loop discuss "Should we use a sync.Pool for the diff buffers?"
+audit-loop discuss --context main.go "Is the error handling in captureDiff sufficient?"
+audit-loop discuss --context "main.go,prompts/" "Should we split this into packages?"
+```
+
+### Anti-sycophancy: Blind First Round
+
+LLMs default to agreement when shown well-reasoned prior positions. To force genuine deliberation:
+
+**Round 1** is blind — both agents receive the question + context independently. Neither sees the other's position. This produces two uncontaminated takes.
+
+**Round 2+** each agent sees the other's prior position and must:
+1. Steelman the opposing view (articulate the strongest version of it)
+2. State where they agree
+3. State where they still disagree and why
+
+This makes rubber-stamping structurally difficult.
+
+### Context Parity
+
+Claude runs in print mode (`-p`) — no tool access. Kiro has `read`, `grep`, `glob`, `code`. This asymmetry means Kiro can ground claims in actual code while Claude can only reason from what's in the prompt.
+
+Fix: `--context` files are read and inlined into both agents' prompts. Both see the same code. Kiro *can* look at additional files if it wants to, but Claude always has at minimum what `--context` provides.
+
+### Flow
+
+1. User provides a question + optional `--context` files
+2. **Round 1 (blind):**
+   - Claude receives question + context → states position
+   - Kiro receives question + context → states position independently
+   - Neither sees the other
+3. **Round 2+:**
+   - Claude receives Kiro's prior position → steelmans it, then responds
+   - Kiro receives Claude's prior position → steelmans it, then responds
+4. Repeat until `CONSENSUS` or max rounds hit
+
+### Exit Conditions
+
+- **CONSENSUS**: Both agents agree in the same round. Log captures the shared conclusion.
+- **SPLIT**: Max rounds exhausted, agents did not converge. Log captures both final positions for human decision.
+
+### Output Format (per agent, per round)
+
+```
+CONSENSUS | DISAGREE
+
+## Steelman (opposing view)
+<strongest case for the other side>
+
+## Position
+<own reasoning and conclusion>
+```
+
+Round 1 omits the steelman section (nothing to steelman yet).
+
+### CLI Implementation Note
+
+`flag.Parse()` doesn't handle subcommands. Implementation needs:
+```go
+if len(os.Args) > 1 && os.Args[1] == "discuss" {
+    // strip "discuss" from os.Args, parse remaining flags
+    // enter discuss loop
+}
+// otherwise: default audit behavior
+```
+
+### Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--context PATH` | — | Comma-separated file/dir paths to inline as context |
+| `--max-rounds N` | 3 | Max deliberation rounds |
+| `--question` | — | Alternative to positional arg for the question |
+
+### Log
+
+Same directory (`.audit/reviews/`), filename prefixed with `discuss-`:
+
+```markdown
+# Discussion — <timestamp>
+
+## Question
+<user's question>
+
+## Context
+<files included>
+
+## Round 1 (blind)
+
+### Claude
+<position>
+
+### Kiro
+<position>
+
+## Round 2
+
+### Claude
+**Verdict**: DISAGREE
+**Steelman**: <opposing view>
+**Position**: <own view>
+
+### Kiro
+**Verdict**: CONSENSUS
+**Steelman**: <opposing view>
+**Position**: <own view>
+
+## Conclusion
+✅ Consensus: <summary> / ⚠️ Split after N rounds. See final positions above.
+```
+
 ## Future Considerations
 
 - Support swapping auditor (use kiro `reviewer` agent instead of claude, or gemini via API)
 - Support multiple auditors in parallel (claude + gemini, deduplicate findings)
 - Integration with CI (run on PR open)
 - Configurable severity threshold (only loop on critical/high, accept medium/low)
+- Discuss mode: support passing stdin or clipboard content as context

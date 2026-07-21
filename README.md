@@ -17,9 +17,10 @@ Or build from source:
 ```bash
 git clone https://github.com/mobiusdickus/audit-loop.git
 cd audit-loop
-go build -o audit-loop .
-mv audit-loop ~/.local/bin/
+make install
 ```
+
+By default installs to `~/.local/bin/`. Override with `make install PREFIX=/usr/local/bin`.
 
 ## Requirements
 
@@ -32,6 +33,9 @@ mv audit-loop ~/.local/bin/
 ```bash
 # Code review — diff current branch against main
 audit-loop
+
+# Review entire repo
+audit-loop --full
 
 # Code review — custom base branch
 audit-loop --base develop
@@ -49,6 +53,26 @@ audit-loop --theme ./my-theme/
 # Preview without running
 audit-loop --dry-run
 ```
+
+## Discuss Mode
+
+Two-agent deliberation on a design question. Blind first round prevents sycophancy; steelman requirement in subsequent rounds forces genuine debate.
+
+```bash
+# Ask a design question
+audit-loop discuss "Should we use a connection pool here?"
+
+# Include code context for both agents
+audit-loop discuss --context main.go "Is the error handling sufficient?"
+
+# Multiple files/dirs as context
+audit-loop discuss --context "main.go,prompts/" "Should prompts be runtime-configurable?"
+```
+
+- Round 1: both agents state positions independently (blind)
+- Round 2+: each must steelman the opposing view before responding
+- Exit 0 = consensus, Exit 1 = no agreement after max rounds
+- Logs to `.audit/reviews/discuss-<timestamp>.md`
 
 ## How it works
 
@@ -213,9 +237,15 @@ The auditor prompt **must** produce output where the first matching line is eith
 | `--auditor NAME` | claude | Auditor CLI: `claude` or `codex` |
 | `--model MODEL` | claude-sonnet-4-6 | Claude model for auditing |
 | `--timeout SECS` | 300 | Timeout per agent call |
-| `--agent NAME` | mobius | Kiro agent for addressing |
+| `--agent NAME` | — | Kiro agent for addressing |
 | `--log-dir PATH` | .audit/reviews | Log output directory |
 | `--dry-run` | — | Preview without running |
+| `--full` | — | Review entire repo, not just branch diff |
+| `--context PATHS` | — | Comma-separated files/dirs for discuss context |
+
+## Security
+
+Claude runs in print mode (`-p`) with no tools — it only sees the diff text and returns a review. Kiro runs non-interactively with a limited tool set: `read`, `write`, `grep`, `glob`, `code`. No explicit shell or network tools are granted. Neither agent can make external requests.
 
 ## Environment variables
 
